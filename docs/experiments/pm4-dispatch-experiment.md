@@ -21,6 +21,94 @@ within the ROCm ecosystem.
 
 ---
 
+## CRITICAL: CDNA4 / MI355 / gfx950 — AQL is STILL Firmware-Emulated
+
+### Finding: gfx950 is GFX 9.5.0, NOT GFX12
+
+CDNA4 (MI350/MI355) in this codebase is identified as **`gfx950` with ISA version 9.5.0**,
+NOT gfx12. GFX12 is RDNA4 (consumer GPUs like gfx1200/gfx1201). This is confirmed by:
+
+```
+// projects/rocr-runtime/runtime/hsa-runtime/core/runtime/isa.cpp
+ISAREG_ENTRY_GEN("gfx950", 9, 5, 0, any, any, 64, "gfx9-4-generic")
+```
+
+### AQL Processing on ALL current AMD GPUs: MEC Firmware Decode
+
+Based on tinygrad's reverse-engineering of MEC firmware and the code in this repo,
+**AQL packets are NEVER "natively" decoded by hardware**. On ALL current AMD GPUs
+(GFX7 through GFX12, including gfx950/CDNA4), the process is:
+
+1. User writes AQL packet (64 bytes) to the AQL ring buffer
+2. User rings the doorbell (MMIO write)
+3. **MEC firmware** (a microcontroller running on the GPU) reads the AQL packet
+4. **MEC firmware parses each field** and writes to COMPUTE_* registers via register stores
+5. MEC writes `COMPUTE_DISPATCH_INITIATOR` which triggers the actual dispatch
+
+From tinygrad's disassembly of MEC firmware (polaris10, gc_11_0_1):
+```
+DISPATCH_DIRECT:
+    stw r6, reg[r0, #0x2e01]  # COMPUTE_DIM_X
+    stw r4, reg[r0, #0x2e02]  # COMPUTE_DIM_Y
+    stw r5, reg[r0, #0x2e03]  # COMPUTE_DIM_Z
+    stw r3, reg[r0, #0x2e00]  # COMPUTE_DISPATCH_INITIATOR (triggers dispatch)
+```
+
+The `AQL_CONTROL` register bit (`CP_HQD_AQL_CONTROL == 0x1`) tells the MEC "this queue
+uses AQL format" so it knows to parse 64-byte AQL packets instead of variable-length PM4.
+
+### The `AqlEmulationPm4_` Flag — What It Really Means
+
+The codebase has a `PM4_EMULATION` flag, but it means the OPPOSITE of what you'd expect:
+
+```c
+// libhsakmt/include/hsakmt/hsakmttypes.h
+unsigned int AqlEmulationPm4_ : 1; // Indicates device uses AQL emulation via PM4 packets
+```
+
+This flag is `1` when AQL is being **emulated on top of PM4** (the Windows/DXG path
+where the runtime manually translates AQL→PM4 in software, then submits PM4 to the queue).
+On Linux with hardware HWS (Hardware Scheduler), this flag is typically `0` because
+AQL queues are handled by MEC firmware directly.
+
+The key code:
+```c
+// libhsakmt/src/dxg/topology.cpp
+props.Capability2.ui32.AqlEmulationPm4_ =
+    (device->IsAqlSupported() && device->DeviceInfo().hwsInfo.hwsMask.computeHwsEnabled) ? 0 : 1;
+```
+
+- `AqlEmulationPm4_ = 0` → "hardware supports AQL queues (via MEC firmware)"
+- `AqlEmulationPm4_ = 1` → "no AQL HW support, runtime must emulate AQL using PM4"
+
+**Neither case has true "hardware native" AQL decode.** The `0` case means MEC firmware
+does the decode; the `1` case means the host-side software does it.
+
+### Implications for MI355 / gfx950
+
+On your MI355 (gfx950), running Linux with KFD:
+- KFD creates `KFD_IOC_QUEUE_TYPE_COMPUTE_AQL` queues
+- `AqlEmulationPm4_` is likely `0` (MEC firmware handles AQL)
+- **MEC firmware still does the AQL→register-write translation for every dispatch**
+- The PM4 experiment is therefore **still relevant** for MI355
+
+### Verification: Run This on Your MI355
+
+```bash
+# Check the capability2 flag
+cat /sys/class/kfd/kfd/topology/nodes/*/properties | grep capability2
+
+# Check MEC firmware version
+cat /sys/class/drm/card*/device/fw_version/mec_fw_version
+
+# Dump queue state (if umr is available)
+sudo umr -cpc | grep AQL_CONTROL
+# AQL_CONTROL == 0x1 means the queue is in AQL mode (firmware decode)
+# AQL_CONTROL == 0x0 means the queue is in PM4 mode
+```
+
+---
+
 ## Architecture: AQL vs PM4 Dispatch Paths
 
 ### Current AQL path (eager or graph)
